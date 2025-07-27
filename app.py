@@ -1,165 +1,183 @@
-import os, zipfile, hashlib, hmac, struct, logging, random, json
-import urllib
+import os
+import zipfile
+import hashlib
+import hmac
+import struct
+import logging
+import json
 from io import BytesIO
-from logging.handlers import SMTPHandler
 from datetime import datetime, timedelta
-from flask import Flask, request, g, render_template, make_response, redirect, url_for
 
+from flask import (
+    Flask, request, g, render_template, make_response
+)
+from flask import has_request_context
+from logging.handlers import SMTPHandler
+import requests
+
+# --- Flask Setup ---
 app = Flask(__name__)
 app.config.from_object("config")
 
 TEMPLATES = {
-    'U':"templateU.bin",
-    'E':"templateE.bin",
-    'J':"templateJ.bin",
-    'K':"templateK.bin",
+    'U': "templateU.bin",
+    'E': "templateE.bin",
+    'J': "templateJ.bin",
+    'K': "templateK.bin",
 }
 
 BUNDLEBASE = os.path.join(app.root_path, 'bundle')
-COUNTRY_REGIONS = dict([l.split(" ") for l in open(os.path.join(app.root_path, 'country_regions.txt')).read().split("\n") if l])
 
+# --- Load Country Region Mapping ---
+with open(os.path.join(app.root_path, 'country_regions.txt')) as f:
+    COUNTRY_REGIONS = dict(
+        line.strip().split(" ") for line in f if line.strip()
+    )
+
+# --- GeoIP ---
 try:
-    import geoip2.database, geoip2.errors
+    import geoip2.database
+    import geoip2.errors
     gi = geoip2.database.Reader('/usr/share/GeoIP/GeoLite2-Country.mmdb')
 except ImportError:
     gi = None
 
+# --- Logging ---
 class RequestFormatter(logging.Formatter):
     def format(self, record):
-        s = logging.Formatter.format(self, record)
-        try:
-            return '[%s] [%s] [%s %s] '%(self.formatTime(record), request.remote_addr, request.method, request.path) + s
-        except:
-            return '[%s] [SYS] '%self.formatTime(record) + s
+        s = super().format(record)
+        if has_request_context():
+            return f"[{self.formatTime(record)}] [{request.remote_addr}] [{request.method} {request.path}] {s}"
+        return f"[{self.formatTime(record)}] [SYS] {s}"
 
 if not app.debug:
-    mail_handler = SMTPHandler(app.config['SMTP_SERVER'],
-                                app.config['APP_EMAIL'],
-                                app.config['ADMIN_EMAIL'], 'LetterBomb ERROR')
+    mail_handler = SMTPHandler(
+        app.config['SMTP_SERVER'],
+        app.config['APP_EMAIL'],
+        app.config['ADMIN_EMAIL'],
+        'LetterBomb ERROR'
+    )
     mail_handler.setLevel(logging.ERROR)
     app.logger.addHandler(mail_handler)
 
-    handler = logging.FileHandler(os.path.join(app.root_path, 'log', 'info.log'))
-    handler.setLevel(logging.INFO)
-    handler.setFormatter(RequestFormatter())
-    app.logger.addHandler(handler)
+    file_handler = logging.FileHandler(os.path.join(app.root_path, 'log', 'info.log'))
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(RequestFormatter())
+    app.logger.addHandler(file_handler)
 
     app.logger.setLevel(logging.INFO)
     app.logger.warning('Starting...')
 
+# --- Context Processor ---
+@app.context_processor
+def inject_globals():
+    return {
+        "recaptcha_key": app.config['RECAPTCHA_PUBLICKEY']
+    }
+
+# --- Region Lookup ---
 def region():
     if gi is None:
         return 'E'
     try:
         country = gi.country(request.remote_addr).country.iso_code
-        app.logger.info("GI: %s -> %s", request.remote_addr, country)
+        app.logger.info("GeoIP: %s → %s", request.remote_addr, country)
         return COUNTRY_REGIONS.get(country, 'E')
     except geoip2.errors.AddressNotFoundError:
         return 'E'
-    except:
-        app.logger.exception("GeoIP exception")
+    except Exception:
+        app.logger.exception("GeoIP lookup failed")
         return 'E'
 
-def _index(error=None):
-    g.recaptcha_args = 'k=%s' % app.config['RECAPTCHA_PUBLICKEY']
-    rs = make_response(render_template('index.html', region=region(), error=error))
-    #rs.headers['Cache-Control'] = 'private, max-age=0, no-store, no-cache, must-revalidate'
-    #rs.headers['Etag'] = str(random.randrange(2**64))
-    rs.headers['Expires'] = 'Thu, 01 Dec 1983 20:00:00 GMT'
-    return rs
-
-
-@app.route('/')
-def index():
-    return _index()
-
-
+# --- CAPTCHA Verification ---
 def captcha_check():
     try:
-        oform = {
-            #"privatekey": app.config['RECAPTCHA_PRIVATEKEY'],
+        payload = {
             "secret": app.config['RECAPTCHA_PRIVATEKEY'],
-            "remoteip": request.remote_addr,
-            #"challenge": request.form.get('recaptcha_challenge_field',['']),
-            #"response": request.form.get('recaptcha_response_field',[''])
-            "response": request.form.get('g-recaptcha-response',[''])
+            "response": request.form.get('g-recaptcha-response'),
+            "remoteip": request.remote_addr
         }
-        #f = urllib.urlopen("http://api-verify.recaptcha.net/verify", urllib.urlencode(oform))
-        f = urllib.request.urlopen("https://www.google.com/recaptcha/api/siteverify", urllib.parse.urlencode(oform).encode("utf-8"))
-
-        #result = f.readline().replace("\n","")
-        #error = f.readline().replace("\n","")
-        d = json.load(f)
-        result = d["success"]
-        f.close()
-
-        if not result:#  != 'true':
-            #if error != 'incorrect-captcha-sol':
-            app.logger.info("ReCaptcha fail: %r, %r", oform, d)
-            #g.recaptcha_args += "&error=" + error
+        r = requests.post("https://www.google.com/recaptcha/api/siteverify", data=payload)
+        result = r.json()
+        if not result.get("success"):
+            app.logger.info("ReCAPTCHA failure: %r", result)
             return False
-
-    except:
-        #g.recaptcha_args += "&error=unknown"
+        return True
+    except Exception:
+        app.logger.exception("CAPTCHA check failed")
         return False
-    return True
 
+# --- Main Route ---
+@app.route('/')
+def index():
+    return render_template('index.html', region=region())
+
+# --- Exploit Route ---
 @app.route('/haxx', methods=["POST"])
 def haxx():
-    OUI_LIST = [bytes.fromhex(i) for i in open(os.path.join(app.root_path, 'oui_list.txt')).read().split("\n") if len(i) == 6]
-    g.recaptcha_args = 'k=%s' % app.config['RECAPTCHA_PUBLICKEY']
+    # Load valid OUIs
+    with open(os.path.join(app.root_path, 'oui_list.txt')) as f:
+        OUI_LIST = [bytes.fromhex(line.strip()) for line in f if len(line.strip()) == 6]
+
     dt = datetime.utcnow() - timedelta(1)
-    delta = (dt - datetime(2000, 1, 1))
+    delta = dt - datetime(2000, 1, 1)
     timestamp = delta.days * 86400 + delta.seconds
+
     try:
-        mac = bytes((int(request.form[i],16)) for i in "abcdef")
-        template = TEMPLATES[request.form['region']]
-        bundle = 'bundle' in request.form
-    except:
-        return _index("Invalid input.")
+        mac = bytes(int(request.form[i], 16) for i in "abcdef")
+        region_code = request.form['region']
+        template_path = TEMPLATES[region_code]
+        want_bundle = 'bundle' in request.form
+    except Exception:
+        return render_template("index.html", region=region(), error="Invalid input.")
+
     if not captcha_check():
-        return _index("Are you a human?")
+        return render_template("index.html", region=region(), error="Are you a human?")
 
     if mac == b"\x00\x17\xab\x99\x99\x99":
-        app.logger.info('Derp MAC %s at %d ver %s bundle %r', mac.hex(), timestamp, request.form['region'], bundle)
-        return _index("If you're using Dolphin, try File->Open instead ;-).")
+        app.logger.info('Derp MAC %s @ %d [%s] bundle=%r', mac.hex(), timestamp, region_code, want_bundle)
+        return render_template("index.html", region=region(), error="If you're using Dolphin, try File → Open instead ;).")
 
-    if not any([mac.startswith(i) for i in OUI_LIST]):
-        app.logger.info('Bad MAC %s at %d ver %s bundle %r', mac.hex(), timestamp, request.form['region'], bundle)
-        return _index("The exploit will only work if you enter your Wii's MAC address.")
-
+    if not any(mac.startswith(oui) for oui in OUI_LIST):
+        app.logger.info(f'Invalid MAC {mac.hex()} @ {timestamp} [{region_code}] bundle={want_bundle}')
+        return render_template("index.html", region=region(), error="The exploit will only work if you enter your Wii's MAC address.")
 
     key = hashlib.sha1(mac + b"\x75\x79\x79").digest()
-    blob = bytearray(open(os.path.join(app.root_path, template), 'rb').read())
+
+    with open(os.path.join(app.root_path, template_path), 'rb') as f:
+        blob = bytearray(f.read())
+
     blob[0x08:0x10] = key[:8]
     blob[0xb0:0xc4] = bytes(20)
     blob[0x7c:0x80] = struct.pack(">I", timestamp)
     blob[0x80:0x8a] = (b"%010d" % timestamp)
-    blob[0xb0:0xc4] = hmac.new(key[8:], bytes(blob), hashlib.sha1).digest()
+    blob[0xb0:0xc4] = hmac.new(key[8:], blob, hashlib.sha1).digest()
 
-    path = "private/wii/title/HAEA/%s/%s/%04d/%02d/%02d/%02d/%02d/HABA_#1/txt/%08X.000" % (
-        key[:4].hex().upper(), key[4:8].hex().upper(),
-        dt.year, dt.month-1, dt.day, dt.hour, dt.minute, timestamp
+    zip_path = (
+        "private/wii/title/HAEA/"
+        f"{key[:4].hex().upper()}/{key[4:8].hex().upper()}/"
+        f"{dt.year:04d}/{dt.month - 1:02d}/{dt.day:02d}/{dt.hour:02d}/{dt.minute:02d}/"
+        f"HABA_#1/txt/{timestamp:08X}.000"
     )
 
-    zipdata = BytesIO()
-    zip = zipfile.ZipFile(zipdata, 'w')
-    zip.writestr(path, blob)
-    BUNDLE = [(name, os.path.join(BUNDLEBASE,name)) for name in os.listdir(BUNDLEBASE) if not name.startswith(".")]
-    if bundle:
-        for name, path in BUNDLE:
-            zip.write(path, name)
-    zip.close()
+    zip_data = BytesIO()
+    with zipfile.ZipFile(zip_data, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr(zip_path, blob)
+        if want_bundle:
+            for name in os.listdir(BUNDLEBASE):
+                if not name.startswith("."):
+                    z.write(os.path.join(BUNDLEBASE, name), name)
 
-    app.logger.info('LetterBombed %s at %d ver %s bundle %r', mac.hex(), timestamp, request.form['region'], bundle)
+    app.logger.info('LetterBombed %s @ %d [%s] bundle=%r', mac.hex(), timestamp, region_code, want_bundle)
 
-    rs = make_response(zipdata.getvalue())
-    zipdata.close()
-    rs.headers.add('Content-Disposition', 'attachment', filename="LetterBomb.zip")
+    rs = make_response(zip_data.getvalue())
+    rs.headers['Content-Disposition'] = 'attachment; filename=LetterBomb.zip'
     rs.headers['Content-Type'] = 'application/zip'
+    rs.headers['Expires'] = 'Thu, 01 Dec 1983 20:00:00 GMT'
     return rs
 
-application=app
+# --- WSGI Entry Point ---
+application = app
 
 if __name__ == "__main__":
-    app.run('0.0.0.0', 10142)
+    app.run(host="0.0.0.0", port=10142)
