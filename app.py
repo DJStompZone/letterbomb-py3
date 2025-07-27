@@ -9,27 +9,37 @@ from io import BytesIO
 from datetime import datetime, timedelta
 
 from flask import (
-    Flask, request, g, render_template, make_response
+    Flask, request, g, render_template, make_response, has_request_context
 )
-from flask import has_request_context
 from logging.handlers import SMTPHandler
 import requests
 
-# --- Flask Setup ---
-app = Flask(__name__)
-app.config.from_object("config")
-
-TEMPLATES = {
+# --- Constants ---
+GEOIP_DB_PATH = '/usr/share/GeoIP/GeoLite2-Country.mmdb'
+OUI_LIST_FILE = 'oui_list.txt'
+COUNTRY_REGIONS_FILE = 'country_regions.txt'
+BUNDLE_DIRNAME = 'bundle'
+EXPLOIT_FILENAME = 'LetterBomb.zip'
+TEMPLATE_FILENAMES = {
     'U': "templateU.bin",
     'E': "templateE.bin",
     'J': "templateJ.bin",
     'K': "templateK.bin",
 }
+DOLPHIN_DERP_MAC = b"\x00\x17\xab\x99\x99\x99"
+BOMB_PATH_TEMPLATE = (
+    "private/wii/title/HAEA/"
+    "{key0}/{key1}/{year:04d}/{month:02d}/{day:02d}/{hour:02d}/{minute:02d}/"
+    "HABA_#1/txt/{timestamp:08X}.000"
+)
 
-BUNDLEBASE = os.path.join(app.root_path, 'bundle')
+# --- Flask Setup ---
+app = Flask(__name__)
+app.config.from_object("config")
+BUNDLEBASE = os.path.join(app.root_path, BUNDLE_DIRNAME)
 
 # --- Load Country Region Mapping ---
-with open(os.path.join(app.root_path, 'country_regions.txt')) as f:
+with open(os.path.join(app.root_path, COUNTRY_REGIONS_FILE)) as f:
     COUNTRY_REGIONS = dict(
         line.strip().split(" ") for line in f if line.strip()
     )
@@ -38,7 +48,7 @@ with open(os.path.join(app.root_path, 'country_regions.txt')) as f:
 try:
     import geoip2.database
     import geoip2.errors
-    gi = geoip2.database.Reader('/usr/share/GeoIP/GeoLite2-Country.mmdb')
+    gi = geoip2.database.Reader(GEOIP_DB_PATH)
 except ImportError:
     gi = None
 
@@ -81,7 +91,7 @@ def region():
         return 'E'
     try:
         country = gi.country(request.remote_addr).country.iso_code
-        app.logger.info("GeoIP: %s → %s", request.remote_addr, country)
+        app.logger.info(f"GeoIP: {request.remote_addr} → {country}")
         return COUNTRY_REGIONS.get(country, 'E')
     except geoip2.errors.AddressNotFoundError:
         return 'E'
@@ -100,7 +110,7 @@ def captcha_check():
         r = requests.post("https://www.google.com/recaptcha/api/siteverify", data=payload)
         result = r.json()
         if not result.get("success"):
-            app.logger.info("ReCAPTCHA failure: %r", result)
+            app.logger.info(f"ReCAPTCHA failure: {result}")
             return False
         return True
     except Exception:
@@ -115,18 +125,16 @@ def index():
 # --- Exploit Route ---
 @app.route('/haxx', methods=["POST"])
 def haxx():
-    # Load valid OUIs
-    with open(os.path.join(app.root_path, 'oui_list.txt')) as f:
+    with open(os.path.join(app.root_path, OUI_LIST_FILE)) as f:
         OUI_LIST = [bytes.fromhex(line.strip()) for line in f if len(line.strip()) == 6]
 
-    dt = datetime.utcnow() - timedelta(1)
-    delta = dt - datetime(2000, 1, 1)
-    timestamp = delta.days * 86400 + delta.seconds
+    dt = datetime.utcnow() - timedelta(days=1)
+    timestamp = int((dt - datetime(2000, 1, 1)).total_seconds())
 
     try:
         mac = bytes(int(request.form[i], 16) for i in "abcdef")
         region_code = request.form['region']
-        template_path = TEMPLATES[region_code]
+        template_filename = TEMPLATE_FILENAMES[region_code]
         want_bundle = 'bundle' in request.form
     except Exception:
         return render_template("index.html", region=region(), error="Invalid input.")
@@ -134,30 +142,34 @@ def haxx():
     if not captcha_check():
         return render_template("index.html", region=region(), error="Are you a human?")
 
-    if mac == b"\x00\x17\xab\x99\x99\x99":
-        app.logger.info('Derp MAC %s @ %d [%s] bundle=%r', mac.hex(), timestamp, region_code, want_bundle)
-        return render_template("index.html", region=region(), error="If you're using Dolphin, try File → Open instead ;).")
+    if mac == DOLPHIN_DERP_MAC:
+        app.logger.info(f"Derp MAC {mac.hex()} @ {timestamp} [{region_code}] bundle={want_bundle}")
+        return render_template("index.html", region=region(), error="If you're using Dolphin, try File → Open instead ;)")
 
     if not any(mac.startswith(oui) for oui in OUI_LIST):
-        app.logger.info(f'Invalid MAC {mac.hex()} @ {timestamp} [{region_code}] bundle={want_bundle}')
+        app.logger.info(f"Invalid MAC {mac.hex()} @ {timestamp} [{region_code}] bundle={want_bundle}")
         return render_template("index.html", region=region(), error="The exploit will only work if you enter your Wii's MAC address.")
 
-    key = hashlib.sha1(mac + b"\x75\x79\x79").digest()
+    key = hashlib.sha1(mac + b"uyy").digest()
 
-    with open(os.path.join(app.root_path, template_path), 'rb') as f:
+    with open(os.path.join(app.root_path, template_filename), 'rb') as f:
         blob = bytearray(f.read())
 
     blob[0x08:0x10] = key[:8]
     blob[0xb0:0xc4] = bytes(20)
     blob[0x7c:0x80] = struct.pack(">I", timestamp)
-    blob[0x80:0x8a] = (b"%010d" % timestamp)
+    blob[0x80:0x8a] = f"{timestamp:010d}".encode()
     blob[0xb0:0xc4] = hmac.new(key[8:], blob, hashlib.sha1).digest()
 
-    zip_path = (
-        "private/wii/title/HAEA/"
-        f"{key[:4].hex().upper()}/{key[4:8].hex().upper()}/"
-        f"{dt.year:04d}/{dt.month - 1:02d}/{dt.day:02d}/{dt.hour:02d}/{dt.minute:02d}/"
-        f"HABA_#1/txt/{timestamp:08X}.000"
+    zip_path = BOMB_PATH_TEMPLATE.format(
+        key0=key[:4].hex().upper(),
+        key1=key[4:8].hex().upper(),
+        year=dt.year,
+        month=dt.month - 1,
+        day=dt.day,
+        hour=dt.hour,
+        minute=dt.minute,
+        timestamp=timestamp
     )
 
     zip_data = BytesIO()
@@ -168,10 +180,10 @@ def haxx():
                 if not name.startswith("."):
                     z.write(os.path.join(BUNDLEBASE, name), name)
 
-    app.logger.info('LetterBombed %s @ %d [%s] bundle=%r', mac.hex(), timestamp, region_code, want_bundle)
+    app.logger.info(f"LetterBombed {mac.hex()} @ {timestamp} [{region_code}] bundle={want_bundle}")
 
     rs = make_response(zip_data.getvalue())
-    rs.headers['Content-Disposition'] = 'attachment; filename=LetterBomb.zip'
+    rs.headers['Content-Disposition'] = f'attachment; filename={EXPLOIT_FILENAME}'
     rs.headers['Content-Type'] = 'application/zip'
     rs.headers['Expires'] = 'Thu, 01 Dec 1983 20:00:00 GMT'
     return rs
